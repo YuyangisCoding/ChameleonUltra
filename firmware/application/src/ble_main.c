@@ -102,7 +102,16 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 };
 volatile bool g_is_ble_connected = false;
 volatile bool g_is_low_battery_shutdown = false;
+static bool m_ble_initialized = false;                                              /**< Track whether BLE/SoftDevice has been initialized */
 static ble_opt_t m_static_pin_option;
+
+/**@brief Check if BLE/SoftDevice has been initialized.
+ *
+ * @return true if BLE is initialized, false otherwise.
+ */
+bool is_ble_initialized(void) {
+    return m_ble_initialized;
+}
 
 // Simple function to provide an index to the next input buffer
 // Will simply alernate between 0 and 1 when SAADC_BUF_COUNT is 2
@@ -768,6 +777,9 @@ void create_battery_timer(void) {
  * @brief Function for init ble slave.
  */
 void ble_slave_init(void) {
+    if (m_ble_initialized) {
+        return;  // Already initialized
+    }
     adc_configure();                    // ADC initialization
     create_battery_timer();             // Create a battery power update timer
     ble_stack_init();                   // BLE protocol stack initialization
@@ -777,6 +789,7 @@ void ble_slave_init(void) {
     advertising_init();                 // Broadcast parameter initialization
     conn_params_init();                 // Connection parameter initialization
     peer_manager_init();                // Peer manager Initialization
+    m_ble_initialized = true;           // Mark BLE as initialized
 }
 
 void register_lf_adc_callback(lf_adc_callback_t cb) {

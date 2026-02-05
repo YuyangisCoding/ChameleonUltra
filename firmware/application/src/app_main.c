@@ -67,6 +67,9 @@ volatile bool m_is_field_on = false;
 static uint32_t m_reset_source;
 static uint32_t m_gpregret_val;
 
+// Flag indicating if woken by RF field (skip BLE init for faster boot)
+static bool m_wakeup_from_rf_field = false;
+
 #define GPREGRET_CLEAR_VALUE_DEFAULT (0xFFFFFFFFUL)
 #define RESET_ON_LF_FIELD_EXISTS_Msk (1UL)
 
@@ -344,8 +347,15 @@ static void system_off_enter(void) {
         // POWER_RAM_POWER_S3RETENTION_On << POWER_RAM_POWER_S3RETENTION_Pos |
         // POWER_RAM_POWER_S4RETENTION_On << POWER_RAM_POWER_S4RETENTION_Pos |
         POWER_RAM_POWER_S5RETENTION_On << POWER_RAM_POWER_S5RETENTION_Pos;
-    ret = sd_power_ram_power_set(8, ram8_retention);
-    APP_ERROR_CHECK(ret);
+    
+    // Use appropriate API based on whether SoftDevice is enabled
+    if (is_ble_initialized()) {
+        ret = sd_power_ram_power_set(8, ram8_retention);
+        APP_ERROR_CHECK(ret);
+    } else {
+        // Direct register access when SoftDevice not enabled
+        NRF_POWER->RAM[8].POWERSET = ram8_retention;
+    }
 
     // IOs that need to be configured as floating analog inputs ==> no pull-up or pull-down
     uint32_t gpio_cfg_default_no_pull[] = {
@@ -399,8 +409,13 @@ static void system_off_enter(void) {
         // Close the comparator
         nrf_drv_lpcomp_disable();
         // Set the reason for Reset. After restarting, you need to get this reason to avoid misjudgment from the source of wake up.
-        sd_power_gpregret_clr(1, GPREGRET_CLEAR_VALUE_DEFAULT);
-        sd_power_gpregret_set(1, RESET_ON_LF_FIELD_EXISTS_Msk);
+        // Use appropriate API based on whether SoftDevice is enabled
+        if (is_ble_initialized()) {
+            sd_power_gpregret_clr(1, GPREGRET_CLEAR_VALUE_DEFAULT);
+            sd_power_gpregret_set(1, RESET_ON_LF_FIELD_EXISTS_Msk);
+        } else {
+            NRF_POWER->GPREGRET2 = RESET_ON_LF_FIELD_EXISTS_Msk;
+        }
         // Trigger the RESET awakening system, restart the emulation process
         nrf_pwr_mgmt_shutdown(NRF_PWR_MGMT_SHUTDOWN_RESET);
         return;
@@ -412,14 +427,8 @@ static void system_off_enter(void) {
     // Go to system-off mode (this function will not return; wakeup will cause a reset).
     // Note that if you insert jlink or drive a Debug, you may report an error when entering the low power consumption.
     // When starting debugging, we should disable low power consumption state values, or simply not enter low power consumption
-    ret = sd_power_system_off();
-
-    // OK, here is very important. If you open the log output and enable RTT, you will not check the error of the low power mode
-#if !(NRF_LOG_ENABLED && NRF_LOG_BACKEND_RTT_ENABLED)
-    APP_ERROR_CHECK(ret);
-#else
-    UNUSED_VARIABLE(ret);
-#endif
+    // Use nrf_pwr_mgmt_shutdown which handles both SD and non-SD cases internally
+    nrf_pwr_mgmt_shutdown(NRF_PWR_MGMT_SHUTDOWN_GOTO_SYSOFF);
 
     // It is not supposed to enter here, but jlink debug mode it can be entered, at most is not normal hibernation just
     // jlink connection, power consumption will rise, and hibernation will also be stuck in this step.
@@ -428,14 +437,38 @@ static void system_off_enter(void) {
 }
 
 /**
+ *@brief : Early detection of wake-up source using direct register access.
+ *         This is called BEFORE SoftDevice initialization to determine if we can skip BLE init.
+ *         Uses direct hardware register reads which work without SoftDevice.
+ */
+static void detect_wakeup_source_early(void) {
+    // Read reset reason directly from hardware register (no SoftDevice needed)
+    m_reset_source = nrf_power_resetreas_get();
+    
+    // Read GPREGRET2 directly for LF field detection flag
+    m_gpregret_val = NRF_POWER->GPREGRET2;
+    
+    // Check if woken by RF field (HF NFC or LF LPCOMP)
+    m_wakeup_from_rf_field = (m_reset_source & (NRF_POWER_RESETREAS_NFC_MASK | NRF_POWER_RESETREAS_LPCOMP_MASK)) ||
+                             (m_gpregret_val & RESET_ON_LF_FIELD_EXISTS_Msk);
+    
+    NRF_LOG_INFO("Early wakeup detection: reset_source=0x%08X, gpregret=0x%08X, rf_wakeup=%d", 
+                 m_reset_source, m_gpregret_val, m_wakeup_from_rf_field);
+}
+
+/**
  *@brief :Detection of wake-up source
  */
 static void check_wakeup_src(void) {
-    sd_power_reset_reason_get(&m_reset_source);
-    sd_power_reset_reason_clr(m_reset_source);
-
-    sd_power_gpregret_get(1, &m_gpregret_val);
-    sd_power_gpregret_clr(1, GPREGRET_CLEAR_VALUE_DEFAULT);
+    // Clear the reset reason and GPREGRET registers
+    // Use appropriate API based on whether SoftDevice is enabled
+    if (is_ble_initialized()) {
+        sd_power_reset_reason_clr(m_reset_source);
+        sd_power_gpregret_clr(1, GPREGRET_CLEAR_VALUE_DEFAULT);
+    } else {
+        nrf_power_resetreas_clear(m_reset_source);
+        NRF_POWER->GPREGRET2 = 0;
+    }
 
 
     /*
@@ -943,7 +976,8 @@ static void blink_usb_led_status(void) {
 }
 
 static void lesc_event_process(void) {
-    if (settings_get_ble_pairing_enable_first_load()) {
+    // Only process LESC events if BLE is initialized
+    if (is_ble_initialized() && settings_get_ble_pairing_enable_first_load()) {
         ret_code_t err_code;
         err_code = nrf_ble_lesc_request_handler();
         APP_ERROR_CHECK(err_code);
@@ -951,7 +985,7 @@ static void lesc_event_process(void) {
 }
 
 static void ble_passkey_init(void) {
-    if (settings_get_ble_pairing_enable_first_load()) {
+    if (settings_get_ble_pairing_enable_first_load() && is_ble_initialized()) {
         set_ble_connect_key(settings_get_ble_connect_key());
     }
 }
@@ -969,8 +1003,21 @@ int main(void) {
     gpio_te_init();           // Initialize GPIO matrix library
     app_timers_init();        // Initialize soft timer
     power_management_init();  // Power management initialization
+    
+    // Early detection of wakeup source BEFORE BLE init
+    // This uses direct register reads and doesn't need SoftDevice
+    detect_wakeup_source_early();
+    
     usb_cdc_init();           // USB cdc emulation initialization
-    ble_slave_init();         // Bluetooth protocol stack initialization
+    
+    // Only initialize BLE/SoftDevice if NOT woken by RF field
+    // This saves ~500ms boot time when waking for card emulation
+    if (!m_wakeup_from_rf_field) {
+        NRF_LOG_INFO("Initializing BLE (not RF wakeup)");
+        ble_slave_init();     // Bluetooth protocol stack initialization (~500ms)
+    } else {
+        NRF_LOG_INFO("Skipping BLE init for faster RF wakeup response");
+    }
 
     rng_drv_and_srand_init(); // Random number generator initialization
     bsp_timer_init();         // Initialize timeout timer

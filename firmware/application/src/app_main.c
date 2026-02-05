@@ -285,6 +285,14 @@ static void button_init(void) {
 static void system_off_enter(void) {
     ret_code_t ret;
     m_system_off_processing = true;
+    
+    // FDS (Flash Data Storage) requires SoftDevice to be enabled.
+    // If BLE was skipped during boot (RF wakeup), we need to initialize it now before saving.
+    if (!is_ble_initialized()) {
+        NRF_LOG_INFO("Late BLE init for flash save");
+        ble_slave_init();
+    }
+    
     // Save tag data
     tag_emulation_save();
 
